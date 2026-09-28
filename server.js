@@ -7,23 +7,34 @@ const { getMessaging } = require('firebase-admin/messaging');
 const fs = require('fs');
 const path = require('path');
 
-// Safe Service Account Loader
-const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
+// Flexible Service Account Loader (Supports Render Env Var & Local File)
+let serviceAccount;
 
-if (fs.existsSync(serviceAccountPath)) {
-  const serviceAccount = require(serviceAccountPath);
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    console.log('🔑 Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT environment variable');
+  } catch (err) {
+    console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:', err.message);
+  }
+} else {
+  const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
+  if (fs.existsSync(serviceAccountPath)) {
+    serviceAccount = require(serviceAccountPath);
+    console.log('🔑 Firebase Admin initialized with local serviceAccountKey.json');
+  }
+}
+
+if (serviceAccount) {
   initializeApp({
     credential: cert(serviceAccount),
   });
-  console.log('🔑 Firebase Admin initialized with serviceAccountKey.json');
 } else {
-  console.warn('⚠️ WARNING: serviceAccountKey.json not found in tmcss-backend folder!');
-  console.warn('   Download it from: Firebase Console → Project Settings → Service accounts → Generate new private key');
+  console.warn('⚠️ WARNING: No service account credentials found! Attempting default credentials...');
   try {
     initializeApp();
-    console.log('ℹ️ Firebase Admin initialized with default credentials.');
   } catch (e) {
-    console.error('❌ Failed to initialize Firebase Admin SDK without credentials.');
+    console.error('❌ Failed to initialize Firebase Admin SDK.');
   }
 }
 
