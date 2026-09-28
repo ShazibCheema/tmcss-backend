@@ -12,23 +12,34 @@ let serviceAccount;
 
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
   try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    console.log('🔑 Firebase Admin initialized from FIREBASE_SERVICE_ACCOUNT environment variable');
+    const rawEnv = process.env.FIREBASE_SERVICE_ACCOUNT.trim();
+    serviceAccount = JSON.parse(rawEnv);
+    console.log('🔑 Firebase Admin loaded from FIREBASE_SERVICE_ACCOUNT environment variable');
   } catch (err) {
-    console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:', err.message);
+    console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT JSON string:', err.message);
   }
 } else {
   const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
   if (fs.existsSync(serviceAccountPath)) {
     serviceAccount = require(serviceAccountPath);
-    console.log('🔑 Firebase Admin initialized with local serviceAccountKey.json');
+    console.log('🔑 Firebase Admin loaded from local serviceAccountKey.json');
   }
 }
 
+// Fix Render / Env Var newline escaping in RSA Private Key
+if (serviceAccount && typeof serviceAccount.private_key === 'string') {
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+}
+
 if (serviceAccount) {
-  initializeApp({
-    credential: cert(serviceAccount),
-  });
+  try {
+    initializeApp({
+      credential: cert(serviceAccount),
+    });
+    console.log(`✅ Firebase Admin initialized for project "${serviceAccount.project_id}"`);
+  } catch (e) {
+    console.error('❌ Failed to initialize Firebase Admin with serviceAccount:', e.message);
+  }
 } else {
   console.warn('⚠️ WARNING: No service account credentials found! Attempting default credentials...');
   try {
@@ -43,7 +54,14 @@ const auth = getAuth();
 const messaging = getMessaging();
 const app = express();
 
-app.use(cors({ origin: true }));
+// Configure CORS for Web / Mobile cross-origin requests
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+app.options('*', cors());
+
 app.use(express.json());
 
 // Request Logger Middleware
@@ -59,8 +77,7 @@ app.get('/', (req, res) => {
 
 // ─── Teacher Token Resolution Helper ──────────────────────────────────────────
 async function getTeacherTokens(teacherId, teacherName) {
-  const tokenList = []; // Array of { docId, token }
-  const seenTokens = new Set();
+  const tokens = new Set();
   const searchId = (teacherId || '').trim();
   const searchName = (teacherName || '').trim().toLowerCase();
 
@@ -70,41 +87,33 @@ async function getTeacherTokens(teacherId, teacherName) {
     if (directDoc.exists) {
       const data = directDoc.data();
       if (Array.isArray(data?.fcmTokens)) {
-        data.fcmTokens.forEach(t => {
-          if (typeof t === 'string' && t.trim() && !seenTokens.has(t.trim())) {
-            seenTokens.add(t.trim());
-            tokenList.push({ docId: directDoc.id, token: t.trim() });
-          }
-        });
+        data.fcmTokens.forEach(t => typeof t === 'string' && t.trim() && tokens.add(t.trim()));
       }
     }
   }
 
-  // 2. Search Users Collection by teacherId, uid, or name
-  const usersSnap = await db.collection('users').get();
-  usersSnap.forEach(doc => {
-    const d = doc.data();
-    const uid = (d.uid || doc.id || '').toString();
-    const name = (d.name || '').toString().toLowerCase();
-    const storedTeacherId = (d.teacherId || '').toString();
+  // 2. Fallback: Search Users Collection by teacherId, uid, or name
+  if (tokens.size === 0) {
+    const usersSnap = await db.collection('users').get();
+    usersSnap.forEach(doc => {
+      const d = doc.data();
+      const uid = (d.uid || doc.id || '').toString();
+      const name = (d.name || '').toString().toLowerCase();
+      const storedTeacherId = (d.teacherId || '').toString();
 
-    const nameMatch = searchName.length > 0 &&
-      (name.includes(searchName) || searchName.includes(name));
-    const idMatch = (uid === searchId || storedTeacherId === searchId);
+      const nameMatch = searchName.length > 0 &&
+        (name.includes(searchName) || searchName.includes(name));
+      const idMatch = (uid === searchId || storedTeacherId === searchId);
 
-    if (idMatch || nameMatch) {
-      if (Array.isArray(d.fcmTokens)) {
-        d.fcmTokens.forEach(t => {
-          if (typeof t === 'string' && t.trim() && !seenTokens.has(t.trim())) {
-            seenTokens.add(t.trim());
-            tokenList.push({ docId: doc.id, token: t.trim() });
-          }
-        });
+      if (idMatch || nameMatch) {
+        if (Array.isArray(d.fcmTokens)) {
+          d.fcmTokens.forEach(t => typeof t === 'string' && t.trim() && tokens.add(t.trim()));
+        }
       }
-    }
-  });
+    });
+  }
 
-  return tokenList;
+  return Array.from(tokens);
 }
 
 // ─── GR/CR Push Notification Endpoint ──────────────────────────────────────────
@@ -122,8 +131,8 @@ app.post('/api/notifications/send-grcr', async (req, res) => {
     try {
       decodedToken = await auth.verifyIdToken(idToken);
     } catch (err) {
-      console.warn('❌ [Auth Error] Failed to verify Firebase ID Token:', err.message);
-      return res.status(401).json({ error: 'Unauthorized: Invalid Firebase ID Token' });
+      console.error('❌ [Auth Error] Failed to verify Firebase ID Token:', err.message);
+      return res.status(401).json({ error: 'Unauthorized: Invalid Firebase ID Token', details: err.message });
     }
 
     const callerUid = decodedToken.uid;
@@ -147,95 +156,92 @@ app.post('/api/notifications/send-grcr', async (req, res) => {
     const msgData = msgDoc.data();
     console.log(`📄 [Message Found] Student: "${msgData.studentName}" (${msgData.studentId}), Teacher: "${msgData.teacherName}" (${msgData.teacherId}), Class: "${msgData.className}"`);
 
-    // 4. Fetch Teacher FCM Tokens
-    const tokenItems = await getTeacherTokens(msgData.teacherId, msgData.teacherName);
-    console.log(`📱 [Tokens Resolved] Found ${tokenItems.length} FCM token(s) for teacher "${msgData.teacherName}"`);
+    // 4. Verify Student Authorization (Caller must be the message creator)
+    if (msgData.studentId && msgData.studentId !== callerUid && msgData.grcrStudentId !== callerUid) {
+      console.warn(`⚠️ [Auth Warning] Caller UID (${callerUid}) does not match stored studentId (${msgData.studentId})`);
+    }
 
-    if (tokenItems.length === 0) {
+    // 5. Fetch Teacher FCM Tokens
+    const tokens = await getTeacherTokens(msgData.teacherId, msgData.teacherName);
+    console.log(`📱 [Tokens Resolved] Found ${tokens.length} FCM token(s) for teacherId="${msgData.teacherId}" / teacherName="${msgData.teacherName}"`);
+
+    if (tokens.length === 0) {
       console.warn(`⚠️ [FCM Warning] Teacher "${msgData.teacherName}" has 0 active FCM tokens registered in Firestore users collection.`);
       return res.status(200).json({ success: true, message: 'Teacher has no active FCM tokens registered' });
     }
 
-    // 5. Prepare Payload Template
+    // 6. Prepare FCM Payload
     const typeLabel = msgData.messageType === 'courseContentReminder'
       ? 'Content Reminder'
       : msgData.messageType === 'courseQuery'
         ? 'Course Query'
         : 'General Message';
 
-    // 6. Sequential Push Delivery: Stop immediately after 1 successful notification!
-    let delivered = false;
-    let deliveredMessageId = null;
-    const invalidTokensMap = [];
-
-    console.log(`🚀 [FCM Sending] Testing ${tokenItems.length} token(s) sequentially (will stop after 1st successful delivery)...`);
-
-    for (let i = 0; i < tokenItems.length; i++) {
-      const item = tokenItems[i];
-
-      const singlePayload = {
-        token: item.token,
+    const payload = {
+      notification: {
+        title: `📚 ${typeLabel} — ${msgData.className}`,
+        body: `${msgData.studentName} (GR/CR): ${msgData.message}`,
+      },
+      data: {
+        type: 'grcr_new_message',
+        messageId: messageId,
+        teacherId: String(msgData.teacherId || ''),
+        className: String(msgData.className || ''),
+      },
+      android: {
+        priority: 'high',
         notification: {
-          title: `📚 ${typeLabel} — ${msgData.className}`,
-          body: `${msgData.studentName} (GR/CR): ${msgData.message}`,
+          channelId: 'tmcss_high_importance_channel',
+          icon: 'ic_stat_tmcss',
+          sound: 'default',
         },
-        data: {
-          type: 'grcr_new_message',
-          messageId: messageId,
-          teacherId: String(msgData.teacherId || ''),
-          className: String(msgData.className || ''),
-        },
-        android: {
-          priority: 'high',
-          notification: {
-            channelId: 'tmcss_high_importance_channel',
-            icon: 'ic_stat_tmcss',
-            sound: 'default',
-          },
-        },
-      };
+      },
+      tokens: tokens,
+    };
 
-      try {
-        const messageIdResult = await messaging.send(singlePayload);
-        console.log(`✨ [Success] Token [${i}] delivered successfully! MessageID: ${messageIdResult}`);
-        delivered = true;
-        deliveredMessageId = messageIdResult;
-        break; // Stop immediately so teacher receives EXACTLY 1 notification!
-      } catch (sendErr) {
-        console.warn(`❌ Token [${i}] failed: ${sendErr.code} - ${sendErr.message}`);
+    // 7. Send Push Notifications via FCM Admin SDK Multicast
+    console.log(`🚀 [FCM Sending] Dispatching to ${tokens.length} token(s)...`);
+    const response = await messaging.sendEachForMulticast(payload);
+    console.log(`✅ [FCM Result] Success: ${response.successCount}, Failure: ${response.failureCount}`);
+
+    // 8. Clean up invalid / unregistered tokens automatically
+    const invalidTokens = [];
+    response.responses.forEach((resp, idx) => {
+      if (!resp.success) {
+        console.error(`❌ Token [${idx}] failed: ${resp.error?.code} - ${resp.error?.message}`);
+        const errCode = resp.error?.code;
         if (
-          sendErr.code === 'messaging/registration-token-not-registered' ||
-          sendErr.code === 'messaging/invalid-registration-token'
+          errCode === 'messaging/registration-token-not-registered' ||
+          errCode === 'messaging/invalid-registration-token'
         ) {
-          invalidTokensMap.push(item);
+          invalidTokens.push(tokens[idx]);
         }
+      } else {
+        console.log(`✨ Token [${idx}] delivered successfully! MessageID: ${resp.messageId}`);
+      }
+    });
+
+    if (invalidTokens.length > 0 && msgData.teacherId) {
+      try {
+        await db.collection('users').doc(msgData.teacherId).update({
+          fcmTokens: FieldValue.arrayRemove(...invalidTokens),
+        });
+        console.log(`🧹 [FCM Cleanup] Removed ${invalidTokens.length} invalid token(s) from teacher user document.`);
+      } catch (e) {
+        console.warn('Could not remove invalid tokens:', e.message);
       }
     }
 
-    // 7. Clean up invalid / expired tokens from Firestore user docs
-    if (invalidTokensMap.length > 0) {
-      for (const item of invalidTokensMap) {
-        try {
-          await db.collection('users').doc(item.docId).update({
-            fcmTokens: FieldValue.arrayRemove(item.token),
-          });
-          console.log(`🧹 [FCM Cleanup] Removed invalid token from user doc "${item.docId}"`);
-        } catch (e) {
-          console.warn(`Could not remove invalid token from user doc "${item.docId}": ${e.message}`);
-        }
-      }
-    }
-
-    // 8. Mark Message as Processed in Firestore
+    // 9. Mark Message as Processed in Firestore
     await db.collection('grcr_messages').doc(messageId).update({
-      notificationSent: delivered,
+      notificationSent: true,
       notificationSentAt: FieldValue.serverTimestamp(),
     });
 
     return res.status(200).json({
-      success: delivered,
-      deliveredMessageId: deliveredMessageId,
-      invalidTokensCleaned: invalidTokensMap.length,
+      success: true,
+      successCount: response.successCount,
+      failureCount: response.failureCount,
     });
   } catch (error) {
     console.error('❌ [FCM Server Exception]', error);
